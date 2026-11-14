@@ -31,7 +31,6 @@ import (
 const (
 	defaultConversationsNumericLimit    = 50
 	defaultConversationsExpressionLimit = "1d"
-	maxFileSizeBytes                    = 5 * 1024 * 1024 // 5MB limit
 )
 
 var validFilterKeys = map[string]struct{}{
@@ -133,7 +132,28 @@ type addReactionParams struct {
 }
 
 type filesGetParams struct {
-	fileID string
+	fileIDs   []string
+	channelID string
+	ts        string
+	outputDir string
+	filename  string
+	overwrite bool
+}
+
+type downloadedFileResult struct {
+	FileID    string `json:"file_id"`
+	Filename  string `json:"filename"`
+	Mimetype  string `json:"mimetype"`
+	Size      int    `json:"size"`
+	SavedPath string `json:"saved_path,omitempty"`
+
+	// Set instead of SavedPath when the file lives outside Slack (e.g. a
+	// Google Drive link shared into a message) and was therefore not fetched.
+	Skipped      bool   `json:"skipped,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	ExternalType string `json:"external_type,omitempty"`
+	ExternalURL  string `json:"external_url,omitempty"`
+	DriveFileID  string `json:"drive_file_id,omitempty"`
 }
 
 type usersSearchParams struct {
@@ -602,6 +622,11 @@ func (ch *ConversationsHandler) UsersSearchHandler(ctx context.Context, request 
 	return mcp.NewToolResultText(string(csvBytes)), nil
 }
 
+// FilesGetHandler downloads one or more Slack files straight to a local
+// directory on the machine running the MCP server. It never returns file
+// content inline (that would blow up the agent's context and cap file size);
+// instead it streams each file to disk and returns only metadata plus the
+// saved path. There is no file-size limit.
 func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch.logger.Debug("FilesGetHandler called", zap.Any("params", request.Params))
 
@@ -612,95 +637,278 @@ func (ch *ConversationsHandler) FilesGetHandler(ctx context.Context, request mcp
 
 	params, err := ch.parseParamsToolFilesGet(request)
 	if err != nil {
-		ch.logger.Error("Failed to parse attachment_get_data params", zap.Error(err))
+		ch.logger.Error("Failed to parse conversations_download_file params", zap.Error(err))
 		return nil, err
 	}
 
-	fileInfo, _, _, err := ch.apiProvider.Slack().GetFileInfoContext(ctx, params.fileID, 0, 0)
+	dir, err := prepareOutputDir(params.outputDir)
 	if err != nil {
-		ch.logger.Error("Slack GetFileInfoContext failed", zap.Error(err))
+		ch.logger.Error("Failed to prepare output_dir", zap.Error(err))
 		return nil, err
 	}
 
-	if fileInfo.Size > maxFileSizeBytes {
-		return nil, fmt.Errorf("file size %d bytes exceeds maximum allowed size of %d bytes", fileInfo.Size, maxFileSizeBytes)
+	// Resolve the list of file IDs to download.
+	ids := params.fileIDs
+	if len(ids) == 0 {
+		ids, err = ch.fileIDsFromMessage(ctx, params.channelID, params.ts)
+		if err != nil {
+			ch.logger.Error("Failed to resolve files from message", zap.Error(err))
+			return nil, err
+		}
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("no files are attached to message %s in %s", params.ts, params.channelID)
+		}
 	}
 
-	var buf bytes.Buffer
-	downloadURL := fileInfo.URLPrivateDownload
-	if downloadURL == "" {
-		downloadURL = fileInfo.URLPrivate
-	}
-	if downloadURL == "" {
-		return nil, errors.New("file has no downloadable URL")
+	results := make([]downloadedFileResult, 0, len(ids))
+	var skipped []downloadedFileResult
+	for _, id := range ids {
+		fileInfo, _, _, err := ch.apiProvider.Slack().GetFileInfoContext(ctx, id, 0, 0)
+		if err != nil {
+			ch.logger.Error("Slack GetFileInfoContext failed", zap.String("file_id", id), zap.Error(err))
+			return nil, fmt.Errorf("failed to get info for file %s: %w", id, err)
+		}
+
+		// External files (Google Drive, Dropbox, ...) are only links: their
+		// url_private points at the third-party host, so fetching it would send
+		// our Slack credentials there. Report where the file lives instead.
+		if fileInfo.IsExternal || fileInfo.Mode == "external" {
+			skipped = append(skipped, externalFileResult(fileInfo))
+			continue
+		}
+
+		downloadURL := fileInfo.URLPrivateDownload
+		if downloadURL == "" {
+			downloadURL = fileInfo.URLPrivate
+		}
+		if downloadURL == "" {
+			return nil, fmt.Errorf("file %s has no downloadable URL (it may be a hosted/external doc, not an uploaded file)", id)
+		}
+		if !isSlackFileHost(downloadURL) {
+			return nil, fmt.Errorf("file %s points outside Slack (%s); refusing to send Slack credentials there", id, downloadURL)
+		}
+
+		name := fileInfo.Name
+		if params.filename != "" && len(ids) == 1 {
+			name = params.filename
+		}
+		name = sanitizeFilename(name)
+		if name == "" {
+			name = id
+		}
+
+		dest := filepath.Join(dir, name)
+		if !params.overwrite {
+			dest = uniquePath(dest)
+		}
+
+		f, err := os.Create(dest)
+		if err != nil {
+			ch.logger.Error("Failed to create destination file", zap.String("path", dest), zap.Error(err))
+			return nil, fmt.Errorf("failed to create %s: %w", dest, err)
+		}
+
+		err = ch.apiProvider.Slack().GetFileContext(ctx, downloadURL, f)
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			// Clean up the partial file so we never leave a half-written artifact.
+			_ = os.Remove(dest)
+			ch.logger.Error("Slack GetFileContext failed", zap.String("file_id", id), zap.Error(err))
+			return nil, fmt.Errorf("failed to download file %s: %w", id, err)
+		}
+
+		size := fileInfo.Size
+		if fi, statErr := os.Stat(dest); statErr == nil {
+			size = int(fi.Size())
+		}
+
+		results = append(results, downloadedFileResult{
+			FileID:    fileInfo.ID,
+			Filename:  fileInfo.Name,
+			Mimetype:  fileInfo.Mimetype,
+			Size:      size,
+			SavedPath: dest,
+		})
 	}
 
-	err = ch.apiProvider.Slack().GetFileContext(ctx, downloadURL, &buf)
+	payload := map[string]interface{}{
+		"output_dir": dir,
+		"count":      len(results),
+		"downloaded": results,
+	}
+	if len(skipped) > 0 {
+		payload["skipped"] = skipped
+	}
+	out, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
-		ch.logger.Error("Slack GetFileContext failed", zap.Error(err))
 		return nil, err
 	}
 
-	content := buf.Bytes()
-
-	// For image files, return as native MCP image content so the client
-	// can render them directly without base64-in-JSON overflow.
-	if isImageMimetype(fileInfo.Mimetype) {
-		imageData := base64.StdEncoding.EncodeToString(content)
-		metadata := fmt.Sprintf(`{"file_id":"%s","filename":"%s","mimetype":"%s","size":%d}`,
-			fileInfo.ID,
-			escapeJSON(fileInfo.Name),
-			escapeJSON(fileInfo.Mimetype),
-			len(content))
-		return mcp.NewToolResultImage(metadata, imageData, fileInfo.Mimetype), nil
-	}
-
-	encoding := "none"
-	var contentStr string
-
-	if isTextMimetype(fileInfo.Mimetype) {
-		contentStr = string(content)
-	} else {
-		contentStr = base64.StdEncoding.EncodeToString(content)
-		encoding = "base64"
-	}
-
-	result := fmt.Sprintf(`{"file_id":"%s","filename":"%s","mimetype":"%s","size":%d,"encoding":"%s","content":"%s"}`,
-		fileInfo.ID,
-		escapeJSON(fileInfo.Name),
-		escapeJSON(fileInfo.Mimetype),
-		len(content),
-		encoding,
-		escapeJSON(contentStr))
-
-	return mcp.NewToolResultText(result), nil
+	return mcp.NewToolResultText(string(out)), nil
 }
 
-func isImageMimetype(mimetype string) bool {
-	return strings.HasPrefix(mimetype, "image/")
+// fileIDsFromMessage returns the IDs of every file attached to a single
+// message identified by channel + timestamp. Thread replies are not returned
+// by conversations.history, so a miss there falls back to conversations.replies.
+func (ch *ConversationsHandler) fileIDsFromMessage(ctx context.Context, channel, ts string) ([]string, error) {
+	resp, err := ch.apiProvider.Slack().GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{
+		ChannelID: channel,
+		Latest:    ts,
+		Oldest:    ts,
+		Inclusive: true,
+		Limit:     1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	msgs := resp.Messages
+
+	if !containsTs(msgs, ts) {
+		replies, _, _, err := ch.apiProvider.Slack().GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{
+			ChannelID: channel,
+			Timestamp: ts,
+			Oldest:    ts,
+			Inclusive: true,
+			Limit:     2, // the thread parent may come first, then the reply at ts
+		})
+		if err != nil {
+			return nil, fmt.Errorf("message %s not found in %s: %w", ts, channel, err)
+		}
+		msgs = replies
+	}
+
+	var ids []string
+	for _, m := range msgs {
+		if m.Timestamp != ts {
+			continue
+		}
+		for _, f := range m.Files {
+			if f.ID != "" {
+				ids = append(ids, f.ID)
+			}
+		}
+	}
+	return ids, nil
 }
 
-func isTextMimetype(mimetype string) bool {
-	if strings.HasPrefix(mimetype, "text/") {
-		return true
+func containsTs(msgs []slack.Message, ts string) bool {
+	for _, m := range msgs {
+		if m.Timestamp == ts {
+			return true
+		}
 	}
-	textMimetypes := map[string]bool{
-		"application/json":       true,
-		"application/xml":        true,
-		"application/javascript": true,
-		"application/x-yaml":     true,
-		"application/x-sh":       true,
-	}
-	return textMimetypes[mimetype]
+	return false
 }
 
-func escapeJSON(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	s = strings.ReplaceAll(s, "\n", `\n`)
-	s = strings.ReplaceAll(s, "\r", `\r`)
-	s = strings.ReplaceAll(s, "\t", `\t`)
+// isSlackFileHost reports whether rawURL is served by Slack itself, the only
+// place the Slack token and cookie may be sent.
+func isSlackFileHost(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "slack.com" || strings.HasSuffix(host, ".slack.com")
+}
+
+var driveFileIDPattern = regexp.MustCompile(`(?:/d/|[?&]id=)([A-Za-z0-9_-]{20,})`)
+
+// externalFileResult describes a file that lives outside Slack without
+// fetching it, so the caller can read it with the right tool (e.g. Drive).
+func externalFileResult(f *slack.File) downloadedFileResult {
+	link := f.URLPrivate
+	if link == "" {
+		link = f.Permalink
+	}
+	res := downloadedFileResult{
+		FileID:       f.ID,
+		Filename:     f.Name,
+		Mimetype:     f.Mimetype,
+		Size:         f.Size,
+		Skipped:      true,
+		ExternalType: f.ExternalType,
+		ExternalURL:  link,
+		Reason:       "external file (" + f.ExternalType + "): only a link is stored in Slack; open external_url with the service that hosts it",
+	}
+	if f.ExternalType == "gdrive" {
+		if m := driveFileIDPattern.FindStringSubmatch(link); m != nil {
+			res.DriveFileID = m[1]
+			res.Reason = "Google Drive file shared as a link: read it through Google Drive using drive_file_id"
+		}
+	}
+	return res
+}
+
+var fileIDPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9])(F[A-Z0-9]{6,})`)
+
+// extractFileID accepts either a bare Slack file ID (Fxxxxxxxxxx) or any string
+// containing one (e.g. a files.slack.com URL) and returns the ID.
+func extractFileID(s string) string {
+	s = strings.TrimSpace(s)
+	if m := fileIDPattern.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
 	return s
+}
+
+// prepareOutputDir expands a leading ~, resolves to an absolute path, and
+// creates the directory tree if it does not yet exist.
+func prepareOutputDir(dir string) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", errors.New("output_dir is required")
+	}
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot expand ~: %w", err)
+		}
+		if dir == "~" {
+			dir = home
+		} else {
+			dir = filepath.Join(home, dir[2:])
+		}
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create output_dir %s: %w", abs, err)
+	}
+	return abs, nil
+}
+
+// sanitizeFilename strips any directory components (path-traversal safety) and
+// replaces path separators, so a Slack-provided name can never escape the
+// chosen output directory.
+func sanitizeFilename(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.ReplaceAll(name, "\\", "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	name = filepath.Base(name)
+	if name == "." || name == ".." {
+		return ""
+	}
+	return name
+}
+
+// uniquePath returns dest if nothing exists there, otherwise appends
+// " (1)", " (2)", ... before the extension until it finds a free path.
+func uniquePath(dest string) string {
+	if _, err := os.Stat(dest); errors.Is(err, os.ErrNotExist) {
+		return dest
+	}
+	ext := filepath.Ext(dest)
+	base := strings.TrimSuffix(dest, ext)
+	for i := 1; ; i++ {
+		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate
+		}
+	}
 }
 
 // ConversationsHistoryHandler streams conversation history as CSV
@@ -2308,10 +2516,10 @@ func (ch *ConversationsHandler) parseParamsToolFilesGet(request mcp.CallToolRequ
 	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
 
 	if toolConfig == "" {
-		if !strings.Contains(enabledTools, "attachment_get_data") {
+		if !strings.Contains(enabledTools, "conversations_download_file") {
 			ch.logger.Error("Attachment tool disabled by default")
 			return nil, errors.New(
-				"by default, the attachment_get_data tool is disabled. " +
+				"by default, the conversations_download_file tool is disabled. " +
 					"To enable it, set the SLACK_MCP_ATTACHMENT_TOOL environment variable to true or 1",
 			)
 		}
@@ -2322,13 +2530,50 @@ func (ch *ConversationsHandler) parseParamsToolFilesGet(request mcp.CallToolRequ
 		return nil, errors.New("SLACK_MCP_ATTACHMENT_TOOL must be set to 'true', '1', or 'yes' to enable")
 	}
 
-	fileID := request.GetString("file_id", "")
-	if fileID == "" {
-		return nil, errors.New("file_id is required")
+	outputDir := strings.TrimSpace(request.GetString("output_dir", ""))
+	if outputDir == "" {
+		return nil, errors.New("output_dir is required (files are always saved to disk, never returned inline)")
+	}
+
+	var ids []string
+	seen := make(map[string]bool)
+	addID := func(raw string) {
+		id := extractFileID(raw)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+
+	if single := strings.TrimSpace(request.GetString("file_id", "")); single != "" {
+		addID(single)
+	}
+	for _, raw := range parseCommaSeparatedList(request.GetString("file_ids", "")) {
+		addID(raw)
+	}
+
+	channel := strings.TrimSpace(request.GetString("channel_id", ""))
+	ts := strings.TrimSpace(request.GetString("ts", ""))
+	if ts == "" {
+		ts = strings.TrimSpace(request.GetString("thread_ts", ""))
+	}
+
+	if len(ids) == 0 && (channel == "" || ts == "") {
+		return nil, errors.New("provide file_id, file_ids, or channel_id together with ts")
+	}
+
+	filename := strings.TrimSpace(request.GetString("filename", ""))
+	if filename != "" && len(ids) > 1 {
+		return nil, errors.New("filename can only be used when downloading a single file")
 	}
 
 	return &filesGetParams{
-		fileID: fileID,
+		fileIDs:   ids,
+		channelID: channel,
+		ts:        ts,
+		outputDir: outputDir,
+		filename:  filename,
+		overwrite: request.GetBool("overwrite", false),
 	}, nil
 }
 

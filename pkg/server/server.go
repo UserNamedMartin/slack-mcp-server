@@ -33,7 +33,7 @@ const (
 	ToolConversationsUploadFile     = "conversations_upload_file"
 	ToolReactionsAdd                = "reactions_add"
 	ToolReactionsRemove             = "reactions_remove"
-	ToolAttachmentGetData           = "attachment_get_data"
+	ToolConversationsDownloadFile   = "conversations_download_file"
 	ToolConversationsSearchMessages = "conversations_search_messages"
 	ToolConversationsUnreads        = "conversations_unreads"
 	ToolConversationsMark           = "conversations_mark"
@@ -61,7 +61,7 @@ var ValidToolNames = []string{
 	ToolConversationsUploadFile,
 	ToolReactionsAdd,
 	ToolReactionsRemove,
-	ToolAttachmentGetData,
+	ToolConversationsDownloadFile,
 	ToolConversationsSearchMessages,
 	ToolConversationsUnreads,
 	ToolConversationsMark,
@@ -324,14 +324,32 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 		), conversationsHandler.ReactionsRemoveHandler)
 	}
 
-	if shouldAddTool(ToolAttachmentGetData, enabledTools, "SLACK_MCP_ATTACHMENT_TOOL") {
-		s.AddTool(mcp.NewTool(ToolAttachmentGetData,
-			mcp.WithDescription("Download an attachment's content by file ID. Returns file metadata and content (text files as-is, binary files as base64). Maximum file size is 5MB."),
-			mcp.WithTitleAnnotation("Get Attachment Data"),
+	if shouldAddTool(ToolConversationsDownloadFile, enabledTools, "SLACK_MCP_ATTACHMENT_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsDownloadFile,
+			mcp.WithDescription("Download one or more Slack files (attachments) to a local directory on the machine running this server, and save them to disk. Works for ANY file type and size — images, PDFs, PPTX/DOCX/XLSX, video, archives, etc. The file content is streamed directly to disk and is NEVER returned inline in the response; the tool returns only metadata and the saved path(s) for each file. Specify what to download by file ID (file_id), by several IDs (file_ids), or by pointing at a message (channel_id + ts) to grab all of that message's attachments at once. A full Slack file URL can be passed in place of a bare ID. File IDs (with filenames) appear in the AttachmentIDs field of message metadata when FileCount > 0. External files (e.g. Google Drive links shared into a message) are not downloaded: they come back under 'skipped' with external_url and, for Google Drive, drive_file_id to read through Drive."),
+			mcp.WithTitleAnnotation("Download File"),
 			mcp.WithReadOnlyHintAnnotation(true),
-			mcp.WithString("file_id",
+			mcp.WithString("output_dir",
 				mcp.Required(),
-				mcp.Description("The ID of the attachment to download, in format Fxxxxxxxxxx. Attachment IDs (with filenames) can be found in the AttachmentIDs field of message metadata when FileCount > 0."),
+				mcp.Description("REQUIRED. Absolute or ~-relative local directory to save the downloaded file(s) into. Created automatically if it does not exist. Example: '~/Downloads/slack'."),
+			),
+			mcp.WithString("file_id",
+				mcp.Description("A single file to download: either a bare Slack file ID in format Fxxxxxxxxxx, or a full Slack file URL containing one."),
+			),
+			mcp.WithString("file_ids",
+				mcp.Description("Comma-separated list of file IDs (or Slack file URLs) to download in one call. Combine with or use instead of file_id."),
+			),
+			mcp.WithString("channel_id",
+				mcp.Description("Channel ID (Cxxxxxxxxxx). When given together with 'ts', downloads ALL files attached to that specific message. Ignored if file_id/file_ids are provided."),
+			),
+			mcp.WithString("ts",
+				mcp.Description("Timestamp of the message whose attachments should be downloaded, in format 1234567890.123456. Requires channel_id."),
+			),
+			mcp.WithString("filename",
+				mcp.Description("Optional override for the saved file name. Only allowed when downloading exactly one file; otherwise the original Slack filenames are used."),
+			),
+			mcp.WithBoolean("overwrite",
+				mcp.Description("If true, overwrite an existing file at the destination. If false (default), a numeric suffix like ' (1)' is appended to avoid clobbering."),
 			),
 		), conversationsHandler.FilesGetHandler)
 	}

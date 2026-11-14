@@ -102,7 +102,7 @@ func TestValidToolNames(t *testing.T) {
 			ToolConversationsUploadFile:     true,
 			ToolReactionsAdd:                true,
 			ToolReactionsRemove:             true,
-			ToolAttachmentGetData:           true,
+			ToolConversationsDownloadFile:   true,
 			ToolConversationsSearchMessages: true,
 			ToolConversationsUnreads:        true,
 			ToolConversationsMark:           true,
@@ -134,7 +134,7 @@ func TestValidToolNames(t *testing.T) {
 		assert.Equal(t, "conversations_add_message", ToolConversationsAddMessage)
 		assert.Equal(t, "reactions_add", ToolReactionsAdd)
 		assert.Equal(t, "reactions_remove", ToolReactionsRemove)
-		assert.Equal(t, "attachment_get_data", ToolAttachmentGetData)
+		assert.Equal(t, "conversations_download_file", ToolConversationsDownloadFile)
 		assert.Equal(t, "conversations_search_messages", ToolConversationsSearchMessages)
 		assert.Equal(t, "conversations_unreads", ToolConversationsUnreads)
 		assert.Equal(t, "conversations_mark", ToolConversationsMark)
@@ -289,29 +289,29 @@ func TestShouldAddTool_WriteTool_Reactions(t *testing.T) {
 	})
 }
 
-func TestShouldAddTool_WriteTool_Attachment(t *testing.T) {
+func TestShouldAddTool_WriteTool_DownloadFile(t *testing.T) {
 	t.Run("empty enabledTools and no env var - not registered", func(t *testing.T) {
 		cleanup := setEnv("SLACK_MCP_ATTACHMENT_TOOL", "")
 		defer cleanup()
 
-		result := shouldAddTool(ToolAttachmentGetData, []string{}, "SLACK_MCP_ATTACHMENT_TOOL")
-		assert.False(t, result, "attachment_get_data should NOT be registered when env var is not set")
+		result := shouldAddTool(ToolConversationsDownloadFile, []string{}, "SLACK_MCP_ATTACHMENT_TOOL")
+		assert.False(t, result, "conversations_download_file should NOT be registered when env var is not set")
 	})
 
 	t.Run("empty enabledTools and env var set - registered", func(t *testing.T) {
 		cleanup := setEnv("SLACK_MCP_ATTACHMENT_TOOL", "true")
 		defer cleanup()
 
-		result := shouldAddTool(ToolAttachmentGetData, []string{}, "SLACK_MCP_ATTACHMENT_TOOL")
-		assert.True(t, result, "attachment_get_data should be registered when env var is set")
+		result := shouldAddTool(ToolConversationsDownloadFile, []string{}, "SLACK_MCP_ATTACHMENT_TOOL")
+		assert.True(t, result, "conversations_download_file should be registered when env var is set")
 	})
 
 	t.Run("explicit enabledTools includes tool - registered without env var", func(t *testing.T) {
 		cleanup := setEnv("SLACK_MCP_ATTACHMENT_TOOL", "")
 		defer cleanup()
 
-		result := shouldAddTool(ToolAttachmentGetData, []string{ToolAttachmentGetData}, "SLACK_MCP_ATTACHMENT_TOOL")
-		assert.True(t, result, "attachment_get_data should be registered when explicitly in enabledTools")
+		result := shouldAddTool(ToolConversationsDownloadFile, []string{ToolConversationsDownloadFile}, "SLACK_MCP_ATTACHMENT_TOOL")
+		assert.True(t, result, "conversations_download_file should be registered when explicitly in enabledTools")
 	})
 }
 
