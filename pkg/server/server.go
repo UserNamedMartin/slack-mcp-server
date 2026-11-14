@@ -28,6 +28,9 @@ const (
 	ToolConversationsHistory        = "conversations_history"
 	ToolConversationsReplies        = "conversations_replies"
 	ToolConversationsAddMessage     = "conversations_add_message"
+	ToolConversationsEditMessage    = "conversations_edit_message"
+	ToolConversationsDeleteMessage  = "conversations_delete_message"
+	ToolConversationsUploadFile     = "conversations_upload_file"
 	ToolReactionsAdd                = "reactions_add"
 	ToolReactionsRemove             = "reactions_remove"
 	ToolAttachmentGetData           = "attachment_get_data"
@@ -53,6 +56,9 @@ var ValidToolNames = []string{
 	ToolConversationsHistory,
 	ToolConversationsReplies,
 	ToolConversationsAddMessage,
+	ToolConversationsEditMessage,
+	ToolConversationsDeleteMessage,
+	ToolConversationsUploadFile,
 	ToolReactionsAdd,
 	ToolReactionsRemove,
 	ToolAttachmentGetData,
@@ -189,16 +195,95 @@ func NewMCPServer(provider *provider.ApiProvider, logger *zap.Logger, enabledToo
 				mcp.Description("Unique identifier of either a thread's parent message or a message in the thread_ts must be the timestamp in format 1234567890.123456 of an existing message with 0 or more replies. Optional, if not provided the message will be added to the channel itself, otherwise it will be added to the thread."),
 			),
 			mcp.WithString("text",
-				mcp.Description("Message text in specified content_type format. Example: 'Hello, world!' for text/plain or '# Hello, world!' for text/markdown."),
+				mcp.Description("Message text. In the default 'text/markdown' mode this is parsed as CommonMark and converted to NATIVE Slack Block Kit (real rich_text bullet/numbered lists, links, quotes, code). FORMATTING RULES for markdown mode — follow these to avoid everything collapsing onto one line: (1) separate paragraphs AND lists with a BLANK line — a single newline is only a soft-wrap and renders as a space; (2) use '- ' or '1. ' for lists (NOT the '•' character, which is not a list marker); put a blank line before the list; (3) write links as [label](url), NOT Slack's <url|label> syntax; (4) <@U123> user mentions work as-is. Example that renders correctly: 'Done:\\n\\n- first item\\n- second item\\n\\nSee [ticket](https://example.com).' Use content_type 'text/plain' to send literal text (newlines preserved, but no formatting at all)."),
 			),
 			mcp.WithString("content_type",
 				mcp.DefaultString("text/markdown"),
-				mcp.Description("Content type of the message. Default is 'text/markdown'. Allowed values: 'text/markdown', 'text/plain'. Ignored when blocks is provided."),
+				mcp.Description("Content type of the message. Default 'text/markdown' parses text as CommonMark and renders it as native Slack Block Kit (real lists, links, quotes, code). 'text/plain' sends the text literally: newlines are preserved but NO formatting is applied. Ignored when blocks is provided. Reminder for markdown mode: blank lines separate blocks, '- '/'1. ' make lists, [text](url) makes links — do NOT use '•' bullets, <url|text> links, or rely on single newlines for line breaks."),
 			),
 			mcp.WithString("blocks",
 				mcp.Description("Raw Slack Block Kit JSON array for rich message formatting (rich_text lists, code blocks, etc.). When provided, this takes precedence over text/content_type for rendering. The text parameter becomes the notification fallback text."),
 			),
 		), conversationsHandler.ConversationsAddMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsEditMessage, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsEditMessage,
+			mcp.WithDescription("Edit (update) an existing message in a public channel, private channel, or DM, identified by channel_id and ts. Replaces the message content. With a user token (xoxc/xoxd or xoxp) you can only edit your OWN messages; with a bot token, only the bot's own messages."),
+			mcp.WithTitleAnnotation("Edit Message"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+			),
+			mcp.WithString("ts",
+				mcp.Required(),
+				mcp.Description("Timestamp of the message to edit, in format 1234567890.123456."),
+			),
+			mcp.WithString("text",
+				mcp.Description("New message text. Same formatting rules as conversations_add_message: in the default 'text/markdown' mode write CommonMark — separate paragraphs/lists with a BLANK line, use '- '/'1. ' for lists (not '•'), [label](url) for links (not <url|label>); single newlines collapse to spaces."),
+			),
+			mcp.WithString("content_type",
+				mcp.DefaultString("text/markdown"),
+				mcp.Description("Content type of the new message. Default 'text/markdown' parses text as CommonMark → native Slack Block Kit. 'text/plain' sends literally (newlines preserved, no formatting). Ignored when blocks is provided."),
+			),
+			mcp.WithString("blocks",
+				mcp.Description("Raw Slack Block Kit JSON array. When provided, takes precedence over text/content_type; text becomes the fallback text."),
+			),
+		), conversationsHandler.ConversationsEditMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsDeleteMessage, enabledTools, "SLACK_MCP_DELETE_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsDeleteMessage,
+			mcp.WithDescription("Delete a message from a public channel, private channel, or DM, identified by channel_id and ts. This is IRREVERSIBLE. With a user token (xoxc/xoxd or xoxp) you can only delete your OWN messages; with a bot token, only the bot's own messages. Disabled by default — enable with SLACK_MCP_DELETE_MESSAGE_TOOL."),
+			mcp.WithTitleAnnotation("Delete Message"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+			),
+			mcp.WithString("ts",
+				mcp.Required(),
+				mcp.Description("Timestamp of the message to delete, in format 1234567890.123456."),
+			),
+		), conversationsHandler.ConversationsDeleteMessageHandler)
+	}
+
+	if shouldAddTool(ToolConversationsUploadFile, enabledTools, "SLACK_MCP_ADD_MESSAGE_TOOL") {
+		s.AddTool(mcp.NewTool(ToolConversationsUploadFile,
+			mcp.WithDescription("Upload a file to a public channel, private channel, or DM, optionally with an accompanying message — the file and the message are posted as a SINGLE item. Provide the file either via file_path (a local filesystem path) OR file_data (base64-encoded content). Supports posting into a thread via thread_ts and full message formatting via text/content_type/blocks."),
+			mcp.WithTitleAnnotation("Upload File"),
+			mcp.WithDestructiveHintAnnotation(true),
+			mcp.WithString("channel_id",
+				mcp.Required(),
+				mcp.Description("ID of the channel in format Cxxxxxxxxxx or its name starting with #... or @... aka #general or @username_dm."),
+			),
+			mcp.WithString("file_path",
+				mcp.Description("Absolute local filesystem path of the file to upload. Provide this OR file_data (not both)."),
+			),
+			mcp.WithString("file_data",
+				mcp.Description("Base64-encoded content of the file to upload. Provide this OR file_path (not both). When used, 'filename' is required."),
+			),
+			mcp.WithString("filename",
+				mcp.Description("File name including extension (e.g. 'report.pdf'). Required when using file_data; when using file_path it defaults to the base name of the path."),
+			),
+			mcp.WithString("title",
+				mcp.Description("Optional display title for the file in Slack. Defaults to the filename."),
+			),
+			mcp.WithString("thread_ts",
+				mcp.Description("Optional thread timestamp in format 1234567890.123456 to upload the file into an existing thread."),
+			),
+			mcp.WithString("text",
+				mcp.Description("Optional message posted together with the file. Same formatting rules as conversations_add_message (CommonMark in the default markdown mode: blank lines between blocks, '- '/'1. ' lists, [label](url) links)."),
+			),
+			mcp.WithString("content_type",
+				mcp.DefaultString("text/markdown"),
+				mcp.Description("Content type of the accompanying message. Default 'text/markdown' (CommonMark → native Block Kit); 'text/plain' sends literally. Ignored when blocks is provided."),
+			),
+			mcp.WithString("blocks",
+				mcp.Description("Raw Slack Block Kit JSON array for the accompanying message. When provided, takes precedence over text/content_type."),
+			),
+		), conversationsHandler.ConversationsUploadFileHandler)
 	}
 
 	if shouldAddTool(ToolReactionsAdd, enabledTools, "SLACK_MCP_REACTION_TOOL") {

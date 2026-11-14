@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -96,6 +97,30 @@ type searchParams struct {
 type addMessageParams struct {
 	channel     string
 	threadTs    string
+	text        string
+	contentType string
+	blocks      []slack.Block
+}
+
+type editMessageParams struct {
+	channel     string
+	ts          string
+	text        string
+	contentType string
+	blocks      []slack.Block
+}
+
+type deleteMessageParams struct {
+	channel string
+	ts      string
+}
+
+type uploadFileParams struct {
+	channel     string
+	threadTs    string
+	filename    string
+	title       string
+	data        []byte
 	text        string
 	contentType string
 	blocks      []slack.Block
@@ -224,31 +249,11 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		options = append(options, slack.MsgOptionTS(params.threadTs))
 	}
 
-	if params.blocks != nil {
-		// Raw blocks provided: use them directly. If text is also provided, it
-		// serves as the notification/fallback text.
-		options = append(options, slack.MsgOptionBlocks(params.blocks...))
-		if params.text != "" {
-			options = append(options, slack.MsgOptionText(params.text, false))
-		}
-	} else {
-		switch params.contentType {
-		case "text/plain":
-			options = append(options, slack.MsgOptionDisableMarkdown())
-			options = append(options, slack.MsgOptionText(params.text, false))
-		case "text/markdown":
-			blocks, err := slackGoUtil.ConvertMarkdownTextToBlocks(params.text)
-			if err != nil {
-				ch.logger.Warn("Markdown parsing error", zap.Error(err))
-				options = append(options, slack.MsgOptionDisableMarkdown())
-				options = append(options, slack.MsgOptionText(params.text, false))
-			} else {
-				options = append(options, slack.MsgOptionBlocks(blocks...))
-			}
-		default:
-			return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
-		}
+	contentOptions, err := ch.buildContentOptions(params.text, params.contentType, params.blocks)
+	if err != nil {
+		return nil, err
 	}
+	options = append(options, contentOptions...)
 
 	unfurlOpt := os.Getenv("SLACK_MCP_ADD_MESSAGE_UNFURLING")
 	if text.IsUnfurlingEnabled(params.text, unfurlOpt, ch.logger) {
@@ -282,6 +287,182 @@ func (ch *ConversationsHandler) ConversationsAddMessageHandler(ctx context.Conte
 		return mcp.NewToolResultText(fmt.Sprintf("Successfully posted message to channel %s in thread %s (ts=%s)", respChannel, params.threadTs, respTimestamp)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("Successfully posted message to channel %s (ts=%s)", respChannel, respTimestamp)), nil
+}
+
+// buildContentOptions builds the slack.MsgOption content portion (raw blocks,
+// or markdown/plain text) shared by add_message and edit_message so both format
+// identically.
+func (ch *ConversationsHandler) buildContentOptions(msgText, contentType string, blocks []slack.Block) ([]slack.MsgOption, error) {
+	var options []slack.MsgOption
+	if blocks != nil {
+		// Raw blocks provided: use them directly. If text is also provided, it
+		// serves as the notification/fallback text.
+		options = append(options, slack.MsgOptionBlocks(blocks...))
+		if msgText != "" {
+			options = append(options, slack.MsgOptionText(msgText, false))
+		}
+		return options, nil
+	}
+	switch contentType {
+	case "text/plain":
+		options = append(options, slack.MsgOptionDisableMarkdown())
+		options = append(options, slack.MsgOptionText(msgText, false))
+	case "text/markdown":
+		blks, err := slackGoUtil.ConvertMarkdownTextToBlocks(msgText)
+		if err != nil {
+			ch.logger.Warn("Markdown parsing error", zap.Error(err))
+			options = append(options, slack.MsgOptionDisableMarkdown())
+			options = append(options, slack.MsgOptionText(msgText, false))
+		} else {
+			options = append(options, slack.MsgOptionBlocks(blks...))
+		}
+	default:
+		return nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
+	}
+	return options, nil
+}
+
+// buildUploadContent maps the accompanying-message args to CompleteUploadExternal
+// fields: either Block Kit blocks (markdown/raw) or a plain initial comment.
+func (ch *ConversationsHandler) buildUploadContent(p *uploadFileParams) (slack.Blocks, string) {
+	if p.blocks != nil {
+		return slack.Blocks{BlockSet: p.blocks}, ""
+	}
+	if p.text == "" {
+		return slack.Blocks{}, ""
+	}
+	switch p.contentType {
+	case "text/plain":
+		return slack.Blocks{}, p.text
+	default: // text/markdown
+		blks, err := slackGoUtil.ConvertMarkdownTextToBlocks(p.text)
+		if err != nil {
+			ch.logger.Warn("Markdown parsing error (upload comment)", zap.Error(err))
+			return slack.Blocks{}, p.text
+		}
+		return slack.Blocks{BlockSet: blks}, ""
+	}
+}
+
+// ConversationsEditMessageHandler edits an existing message
+func (ch *ConversationsHandler) ConversationsEditMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsEditMessageHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolEditMessage(ctx, request)
+	if err != nil {
+		ch.logger.Error("Failed to parse edit-message params", zap.Error(err))
+		return nil, err
+	}
+
+	options, err := ch.buildContentOptions(params.text, params.contentType, params.blocks)
+	if err != nil {
+		return nil, err
+	}
+
+	unfurlOpt := os.Getenv("SLACK_MCP_ADD_MESSAGE_UNFURLING")
+	if text.IsUnfurlingEnabled(params.text, unfurlOpt, ch.logger) {
+		options = append(options, slack.MsgOptionEnableLinkUnfurl())
+	} else {
+		options = append(options, slack.MsgOptionDisableLinkUnfurl())
+		options = append(options, slack.MsgOptionDisableMediaUnfurl())
+	}
+
+	respChannel, respTimestamp, _, err := ch.apiProvider.Slack().UpdateMessageContext(ctx, params.channel, params.ts, options...)
+	if err != nil {
+		ch.logger.Error("Slack UpdateMessageContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully edited message in channel %s (ts=%s)", respChannel, respTimestamp)), nil
+}
+
+// ConversationsDeleteMessageHandler deletes a message
+func (ch *ConversationsHandler) ConversationsDeleteMessageHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsDeleteMessageHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolDeleteMessage(ctx, request)
+	if err != nil {
+		ch.logger.Error("Failed to parse delete-message params", zap.Error(err))
+		return nil, err
+	}
+
+	respChannel, respTimestamp, err := ch.apiProvider.Slack().DeleteMessageContext(ctx, params.channel, params.ts)
+	if err != nil {
+		ch.logger.Error("Slack DeleteMessageContext failed", zap.Error(err))
+		return nil, err
+	}
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully deleted message in channel %s (ts=%s)", respChannel, respTimestamp)), nil
+}
+
+// ConversationsUploadFileHandler uploads a file (optionally with a message) via
+// the external-upload flow: get URL -> upload bytes -> complete.
+func (ch *ConversationsHandler) ConversationsUploadFileHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ch.logger.Debug("ConversationsUploadFileHandler called", zap.Any("params", request.Params))
+
+	if ready, err := ch.apiProvider.IsReady(); !ready {
+		ch.logger.Error("API provider not ready", zap.Error(err))
+		return nil, err
+	}
+
+	params, err := ch.parseParamsToolUploadFile(ctx, request)
+	if err != nil {
+		ch.logger.Error("Failed to parse upload-file params", zap.Error(err))
+		return nil, err
+	}
+
+	// 1. Reserve an upload URL and file ID.
+	getResp, err := ch.apiProvider.Slack().GetUploadURLExternalContext(ctx, slack.GetUploadURLExternalParameters{
+		FileName: params.filename,
+		FileSize: len(params.data),
+	})
+	if err != nil {
+		ch.logger.Error("GetUploadURLExternalContext failed", zap.Error(err))
+		return nil, fmt.Errorf("failed to get upload URL: %w", err)
+	}
+
+	// 2. Upload the raw bytes to the reserved URL.
+	if err := ch.apiProvider.Slack().UploadToURL(ctx, slack.UploadToURLParameters{
+		UploadURL: getResp.UploadURL,
+		Reader:    bytes.NewReader(params.data),
+		Filename:  params.filename,
+	}); err != nil {
+		ch.logger.Error("UploadToURL failed", zap.Error(err))
+		return nil, fmt.Errorf("failed to upload file content: %w", err)
+	}
+
+	// 3. Complete the upload, attaching it to the channel with an optional message.
+	blocks, initialComment := ch.buildUploadContent(params)
+	resp, err := ch.apiProvider.Slack().CompleteUploadExternalContext(ctx, slack.CompleteUploadExternalParameters{
+		Files:           []slack.FileSummary{{ID: getResp.FileID, Title: params.title}},
+		Channel:         params.channel,
+		InitialComment:  initialComment,
+		ThreadTimestamp: params.threadTs,
+		Blocks:          blocks,
+	})
+	if err != nil {
+		ch.logger.Error("CompleteUploadExternalContext failed", zap.Error(err))
+		return nil, fmt.Errorf("failed to complete upload: %w", err)
+	}
+
+	fileID := getResp.FileID
+	if resp != nil && len(resp.Files) > 0 {
+		fileID = resp.Files[0].ID
+	}
+	if params.threadTs != "" {
+		return mcp.NewToolResultText(fmt.Sprintf("Successfully uploaded file %q (id=%s) to channel %s in thread %s", params.filename, fileID, params.channel, params.threadTs)), nil
+	}
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully uploaded file %q (id=%s) to channel %s", params.filename, fileID, params.channel)), nil
 }
 
 // ReactionsAddHandler adds an emoji reaction to a message
@@ -1835,6 +2016,239 @@ func (ch *ConversationsHandler) parseParamsToolAddMessage(ctx context.Context, r
 	return &addMessageParams{
 		channel:     channel,
 		threadTs:    threadTs,
+		text:        msgText,
+		contentType: contentType,
+		blocks:      blocks,
+	}, nil
+}
+
+// parseContentArgs parses the shared text/content_type/blocks arguments used by
+// edit_message and upload_file (add_message parses them inline for back-compat).
+func parseContentArgs(request mcp.CallToolRequest) (msgText, contentType string, blocks []slack.Block, err error) {
+	msgText = request.GetString("text", "")
+	if msgText == "" {
+		msgText = request.GetString("payload", "")
+	}
+
+	contentType = request.GetString("content_type", "text/markdown")
+	if contentType != "text/plain" && contentType != "text/markdown" {
+		return "", "", nil, errors.New("content_type must be either 'text/plain' or 'text/markdown'")
+	}
+
+	args := request.GetArguments()
+	if rawBlocks, ok := args["blocks"]; ok && rawBlocks != nil {
+		var blocksJSON []byte
+		switch v := rawBlocks.(type) {
+		case string:
+			if v != "" {
+				blocksJSON = []byte(v)
+			}
+		default:
+			blocksJSON, err = json.Marshal(v)
+			if err != nil {
+				return "", "", nil, fmt.Errorf("blocks must be valid Slack Block Kit JSON: %w", err)
+			}
+		}
+		if blocksJSON != nil {
+			var slackBlocks slack.Blocks
+			if err = json.Unmarshal(blocksJSON, &slackBlocks); err != nil {
+				return "", "", nil, fmt.Errorf("blocks must be valid Slack Block Kit JSON: %w", err)
+			}
+			blocks = slackBlocks.BlockSet
+		}
+	}
+
+	return msgText, contentType, blocks, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolEditMessage(ctx context.Context, request mcp.CallToolRequest) (*editMessageParams, error) {
+	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL")
+	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
+
+	if toolConfig == "" {
+		if !strings.Contains(enabledTools, "conversations_edit_message") && !strings.Contains(enabledTools, "conversations_add_message") {
+			ch.logger.Error("Edit-message tool disabled by default")
+			return nil, errors.New(
+				"by default, the conversations_edit_message tool is disabled to guard Slack workspaces against accidental changes. " +
+					"It shares the posting permission: set the SLACK_MCP_ADD_MESSAGE_TOOL environment variable to true, 1, or a comma separated list of channels " +
+					"to limit where the MCP can edit messages",
+			)
+		}
+		toolConfig = "true"
+	}
+
+	channel := request.GetString("channel_id", "")
+	if channel == "" {
+		ch.logger.Error("channel_id missing in edit-message params")
+		return nil, errors.New("channel_id must be a string")
+	}
+	channel, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		ch.logger.Error("Channel not found", zap.String("channel", channel), zap.Error(err))
+		return nil, err
+	}
+	if !isChannelAllowed(channel) {
+		ch.logger.Warn("Edit-message tool not allowed for channel", zap.String("channel", channel), zap.String("policy", toolConfig))
+		return nil, fmt.Errorf("conversations_edit_message tool is not allowed for channel %q, applied policy: %s", channel, toolConfig)
+	}
+
+	ts := request.GetString("ts", "")
+	if ts == "" || !strings.Contains(ts, ".") {
+		ch.logger.Error("Invalid ts format", zap.String("ts", ts))
+		return nil, errors.New("ts must be a valid timestamp in format 1234567890.123456")
+	}
+
+	msgText, contentType, blocks, err := parseContentArgs(request)
+	if err != nil {
+		return nil, err
+	}
+	if msgText == "" && blocks == nil {
+		ch.logger.Error("Edit message text and blocks both missing")
+		return nil, errors.New("either text or blocks must be provided")
+	}
+
+	return &editMessageParams{
+		channel:     channel,
+		ts:          ts,
+		text:        msgText,
+		contentType: contentType,
+		blocks:      blocks,
+	}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolDeleteMessage(ctx context.Context, request mcp.CallToolRequest) (*deleteMessageParams, error) {
+	toolConfig := os.Getenv("SLACK_MCP_DELETE_MESSAGE_TOOL")
+	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
+
+	if toolConfig == "" {
+		if !strings.Contains(enabledTools, "conversations_delete_message") {
+			ch.logger.Error("Delete-message tool disabled by default")
+			return nil, errors.New(
+				"by default, the conversations_delete_message tool is disabled because deletion is irreversible. " +
+					"To enable it, set the SLACK_MCP_DELETE_MESSAGE_TOOL environment variable to true, 1, or a comma separated list of channels " +
+					"to limit where the MCP can delete messages, e.g. 'SLACK_MCP_DELETE_MESSAGE_TOOL=C1234567890,D0987654321' or 'SLACK_MCP_DELETE_MESSAGE_TOOL=true' for all",
+			)
+		}
+		toolConfig = "true"
+	}
+
+	channel := request.GetString("channel_id", "")
+	if channel == "" {
+		ch.logger.Error("channel_id missing in delete-message params")
+		return nil, errors.New("channel_id is required")
+	}
+	channel, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		ch.logger.Error("Channel not found", zap.String("channel", channel), zap.Error(err))
+		return nil, err
+	}
+	if !isChannelAllowedForConfig(channel, toolConfig) {
+		ch.logger.Warn("Delete-message tool not allowed for channel", zap.String("channel", channel), zap.String("policy", toolConfig))
+		return nil, fmt.Errorf("conversations_delete_message tool is not allowed for channel %q, applied policy: %s", channel, toolConfig)
+	}
+
+	ts := request.GetString("ts", "")
+	if ts == "" || !strings.Contains(ts, ".") {
+		ch.logger.Error("Invalid ts format", zap.String("ts", ts))
+		return nil, errors.New("ts must be a valid timestamp in format 1234567890.123456")
+	}
+
+	return &deleteMessageParams{
+		channel: channel,
+		ts:      ts,
+	}, nil
+}
+
+func (ch *ConversationsHandler) parseParamsToolUploadFile(ctx context.Context, request mcp.CallToolRequest) (*uploadFileParams, error) {
+	toolConfig := os.Getenv("SLACK_MCP_ADD_MESSAGE_TOOL")
+	enabledTools := os.Getenv("SLACK_MCP_ENABLED_TOOLS")
+
+	if toolConfig == "" {
+		if !strings.Contains(enabledTools, "conversations_upload_file") && !strings.Contains(enabledTools, "conversations_add_message") {
+			ch.logger.Error("Upload-file tool disabled by default")
+			return nil, errors.New(
+				"by default, the conversations_upload_file tool is disabled to guard Slack workspaces against accidental uploads. " +
+					"It shares the posting permission: set the SLACK_MCP_ADD_MESSAGE_TOOL environment variable to true, 1, or a comma separated list of channels " +
+					"to limit where the MCP can upload files",
+			)
+		}
+		toolConfig = "true"
+	}
+
+	channel := request.GetString("channel_id", "")
+	if channel == "" {
+		ch.logger.Error("channel_id missing in upload-file params")
+		return nil, errors.New("channel_id must be a string")
+	}
+	channel, err := ch.resolveChannelID(ctx, channel)
+	if err != nil {
+		ch.logger.Error("Channel not found", zap.String("channel", channel), zap.Error(err))
+		return nil, err
+	}
+	if !isChannelAllowed(channel) {
+		ch.logger.Warn("Upload-file tool not allowed for channel", zap.String("channel", channel), zap.String("policy", toolConfig))
+		return nil, fmt.Errorf("conversations_upload_file tool is not allowed for channel %q, applied policy: %s", channel, toolConfig)
+	}
+
+	threadTs := request.GetString("thread_ts", "")
+	if threadTs != "" && !strings.Contains(threadTs, ".") {
+		ch.logger.Error("Invalid thread_ts format", zap.String("thread_ts", threadTs))
+		return nil, errors.New("thread_ts must be a valid timestamp in format 1234567890.123456")
+	}
+
+	filePath := request.GetString("file_path", "")
+	fileData := request.GetString("file_data", "")
+	filename := request.GetString("filename", "")
+	title := request.GetString("title", "")
+
+	if filePath != "" && fileData != "" {
+		return nil, errors.New("provide either file_path or file_data, not both")
+	}
+
+	var data []byte
+	switch {
+	case filePath != "":
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			ch.logger.Error("Failed to read file_path", zap.String("file_path", filePath), zap.Error(err))
+			return nil, fmt.Errorf("failed to read file_path %q: %w", filePath, err)
+		}
+		data = b
+		if filename == "" {
+			filename = filepath.Base(filePath)
+		}
+	case fileData != "":
+		b, err := base64.StdEncoding.DecodeString(fileData)
+		if err != nil {
+			ch.logger.Error("Invalid base64 file_data", zap.Error(err))
+			return nil, fmt.Errorf("file_data must be valid base64: %w", err)
+		}
+		data = b
+		if filename == "" {
+			return nil, errors.New("filename is required when using file_data")
+		}
+	default:
+		return nil, errors.New("either file_path or file_data must be provided")
+	}
+
+	if len(data) == 0 {
+		return nil, errors.New("file is empty")
+	}
+	if title == "" {
+		title = filename
+	}
+
+	msgText, contentType, blocks, err := parseContentArgs(request)
+	if err != nil {
+		return nil, err
+	}
+
+	return &uploadFileParams{
+		channel:     channel,
+		threadTs:    threadTs,
+		filename:    filename,
+		title:       title,
+		data:        data,
 		text:        msgText,
 		contentType: contentType,
 		blocks:      blocks,
